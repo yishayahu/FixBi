@@ -10,6 +10,19 @@ import torch.nn.functional as F
 
 import network.models as models
 
+def optimizer_scheduler(optimizer,current_step,lr,total_steps):
+    p = float(current_step) / total_steps
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr / (1. + 10 * p) ** 0.75
+
+    return optimizer
+
+
+def params():
+    n_clusters = 70
+    dist_loss_lambda = 1
+    acc_amount = 35
+    return n_clusters,dist_loss_lambda,acc_amount
 
 def get_data_info():
     resnet_type = 50
@@ -18,9 +31,9 @@ def get_data_info():
 
 
 def get_net_info(num_classes):
-    net = torch.nn.parallel.DataParallel(models.ResNet50().encoder).cuda()
-    classifier = torch.nn.parallel.DataParallel(nn.Linear(256, num_classes)).cuda()
-    head = torch.nn.parallel.DataParallel(models.Head()).cuda()
+    net = torch.nn.parallel.DataParallel(models.ResNet50().encoder).to(os.environ['CUDA_VISIBLE_DEVICES'])
+    classifier = torch.nn.parallel.DataParallel(nn.Linear(256, num_classes)).to(os.environ['CUDA_VISIBLE_DEVICES'])
+    head = torch.nn.parallel.DataParallel(models.Head()).to(os.environ['CUDA_VISIBLE_DEVICES'])
 
     return net, head, classifier
 
@@ -68,8 +81,8 @@ def evaluate(models, loader):
     set_model_mode('eval', [models])
     with torch.no_grad():
         for step, tgt_data in enumerate(loader):
-            tgt_imgs, tgt_labels = tgt_data
-            tgt_imgs, tgt_labels = tgt_imgs.cuda(non_blocking=True), tgt_labels.cuda(non_blocking=True)
+            tgt_imgs, tgt_labels,_ = tgt_data
+            tgt_imgs, tgt_labels = tgt_imgs.to(os.environ['CUDA_VISIBLE_DEVICES'],non_blocking=True), tgt_labels.to(os.environ['CUDA_VISIBLE_DEVICES'],non_blocking=True)
             tgt_preds = models(tgt_imgs)
             pred = tgt_preds.argmax(dim=1, keepdim=True)
             correct += pred.eq(tgt_labels.long().view_as(pred)).sum().item()
@@ -81,7 +94,7 @@ def evaluate(models, loader):
 
 
 def get_sp_loss(input, target, temp):
-    criterion = nn.NLLLoss(reduction='none').cuda()
+    criterion = nn.NLLLoss(reduction='none').to(os.environ['CUDA_VISIBLE_DEVICES'])
     loss = torch.mul(criterion(torch.log(1 - F.softmax(input / temp, dim=1)), target.detach()), 1).mean()
     return loss
 
@@ -96,7 +109,7 @@ def get_target_preds(args, x):
 
 
 def mixup_criterion_hard(pred, y_a, y_b, lam):
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropyLoss().to(os.environ['CUDA_VISIBLE_DEVICES'])
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
@@ -115,8 +128,8 @@ def final_eval(models_sd, models_td, tgt_test_loader):
 
     with torch.no_grad():
         for step, tgt_data in enumerate(tgt_test_loader):
-            tgt_imgs, tgt_labels = tgt_data
-            tgt_imgs, tgt_labels = tgt_imgs.cuda(), tgt_labels.cuda()
+            tgt_imgs, tgt_labels,_ = tgt_data
+            tgt_imgs, tgt_labels = tgt_imgs.to(os.environ['CUDA_VISIBLE_DEVICES']), tgt_labels.to(os.environ['CUDA_VISIBLE_DEVICES'])
             pred_sd = F.softmax(models_sd(tgt_imgs), dim=1)
             pred_td = F.softmax(models_td(tgt_imgs), dim=1)
             softmax_sum = pred_sd + pred_td

@@ -155,7 +155,7 @@ class ResNet50(nn.Module):
     def __init__(self):
         super(ResNet50, self).__init__()
         self.encoder = resnet50(False)
-        self.encoder.load_state_dict(torch.load('/mnt2/disk2/JMDA/network/resnet50-19c8e357.pth'))
+        self.encoder.load_state_dict(torch.load('resnet50-19c8e357.pth'))
 
     def forward(self, x):
         x = self.encoder(x)

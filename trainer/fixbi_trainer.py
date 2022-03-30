@@ -1,8 +1,40 @@
+import os
 import time
+from pathlib import Path
+import wandb
+import matplotlib.cm as mplcm
+import matplotlib.colors as mplcolors
 import torch
 import torch.nn as nn
 import src.utils as utils
+from scipy.optimize import linear_sum_assignment
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.manifold import TSNE
+from src.utils import params
+import numpy as np
+from tqdm import tqdm
+from torch.autograd import Variable
 
+def get_best_match_aux(distss):
+    n_clusters = len(distss)
+    print('n_clusterss',n_clusters)
+    res = linear_sum_assignment(distss)[1].tolist()
+    targets = [None] *n_clusters
+    for x,y in enumerate(res):
+        targets[y] = x
+    return targets
+
+
+def get_best_match(sc, tc):
+    dists = np.full((sc.shape[0],tc.shape[0]),fill_value=np.inf)
+    for i in range(sc.shape[0]):
+        for j in range(tc.shape[0]):
+            dists[i][j] = np.mean((sc[i]-tc[j])**2)
+    best_match = get_best_match_aux(dists.copy())
+
+    return best_match
 
 def train_fixbi(args, loaders, optimizers, models_sd, models_td, sp_params, losses, epoch):
     print("Epoch: [{}/{}]".format(epoch, args.epochs))
@@ -49,8 +81,8 @@ def train_fixbi(args, loaders, optimizers, models_sd, models_td, sp_params, loss
             if bim_mask_sd.dim() > 0 and bim_mask_td.dim() > 0:
                 if bim_mask_sd.numel() > 0 and bim_mask_td.numel() > 0:
                     bim_mask = min(bim_mask_sd.size(0), bim_mask_td.size(0))
-                    bim_sd_loss = ce(x_sd[bim_mask_td[:bim_mask]], pseudo_td[bim_mask_td[:bim_mask]].cuda().detach())
-                    bim_td_loss = ce(x_td[bim_mask_sd[:bim_mask]], pseudo_sd[bim_mask_sd[:bim_mask]].cuda().detach())
+                    bim_td_loss = ce(x_td[bim_mask_sd[:bim_mask]], pseudo_sd[bim_mask_sd[:bim_mask]].to(os.environ['CUDA_VISIBLE_DEVICES']).detach())
+                    bim_sd_loss = ce(x_sd[bim_mask_td[:bim_mask]], pseudo_td[bim_mask_td[:bim_mask]].to(os.environ['CUDA_VISIBLE_DEVICES']).detach())
 
                     total_loss += bim_sd_loss
                     total_loss += bim_td_loss
@@ -96,3 +128,255 @@ def train_fixbi(args, loaders, optimizers, models_sd, models_td, sp_params, loss
         optimizer_td.step()
 
     print("Train time: {:.2f}".format(time.time() - start))
+
+
+def train_only_source(args, src_train_loader, models_sd, ce, epoch,sched):
+    print("Epoch: [{}/{}]".format(epoch, args.epochs))
+    start = time.time()
+    utils.set_model_mode('train', models=models_sd)
+    losses = []
+    models_sd = nn.Sequential(*models_sd)
+    for step, src_data in tqdm(enumerate(src_train_loader),desc=f'epoch {epoch}'):
+        optimizer = sched(current_step=step+ epoch*len(src_train_loader))
+        src_imgs, src_labels,_ = src_data
+        src_imgs, src_labels = src_imgs.to(os.environ['CUDA_VISIBLE_DEVICES'],non_blocking=True), src_labels.to(os.environ['CUDA_VISIBLE_DEVICES'],non_blocking=True)
+        outputs = models_sd(src_imgs)
+        loss = ce(outputs,src_labels)
+        losses.append(float(loss))
+        if step %10 == 0:
+            print(f'loss {np.mean(losses)}')
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+
+    print("Train time: {:.2f}".format(time.time() - start))
+
+
+class ClusteringTrainer:
+    def __init__(self,loaders, optimizer, models_sd, ce):
+        self.encoder,self.classfier = models_sd[0], nn.Sequential(*models_sd[1:])
+        self.optimizer = optimizer
+        self.src_train_loader,self.tgt_train_loader = loaders
+        self.n_clusters,self.dist_loss_lambda,self.acc_amount = params()
+        self.slice_to_cluster = None
+        self.source_clusters = None
+        self.target_clusters = None
+        self.best_matchs = None
+        self.best_matchs_indexes = None
+        self.accumulate_for_loss = []
+        for _ in range(self.n_clusters):
+            self.accumulate_for_loss.append([])
+        self.slice_to_feature_source = {}
+        self.slice_to_feature_target = {}
+
+        self.epoch_cls_loss = []
+        self.epoch_dist_loss = []
+        self.exp_dir = Path('vizviz1')
+        self.exp_dir.mkdir(exist_ok=True)
+        self.ce = ce
+        self.use_dist_loss = False
+    def train_clustering(self, epoch):
+        vizviz = {}
+
+        # freeze_model(models_sd,exclude_layers = ['init_path', 'down','bottleneck.0','bottleneck.1','bottleneck.2','bottleneck.3.conv_path.0','out_path'])
+
+        self.optimizer.zero_grad()
+        for step, (src_data, tgt_data) in tqdm(enumerate(zip(self.src_train_loader, self.tgt_train_loader)),desc=f'epoch {epoch}',total=min(len(self.src_train_loader),len(self.tgt_train_loader))):
+            if self.best_matchs is None:
+                self.encoder.eval()
+                self.classfier.eval()
+            else:
+                self.encoder.train()
+                self.classfier.train()
+
+            if step ==0 and epoch > 0:
+                self.source_clusters = []
+                self.target_clusters = []
+                self.accumulate_for_loss = []
+                for _ in range(self.n_clusters):
+                    self.accumulate_for_loss.append([])
+                    self.source_clusters.append([])
+                    self.target_clusters.append([])
+                p = PCA(n_components=20,random_state=42)
+                t = TSNE(n_components=2,learning_rate='auto',init='pca',random_state=42)
+                points = []
+
+                for _,feat in self.slice_to_feature_source.items():
+                    points.append(feat)
+
+                for _,feat in self.slice_to_feature_target.items():
+                    points.append(feat)
+
+                points = np.array(points)
+                points = points.reshape(points.shape[0],-1)
+                print('doing tsne')
+                points = p.fit_transform(points)
+                points = t.fit_transform(points)
+                source_points,target_points = points[:len(self.slice_to_feature_source)],points[len(self.slice_to_feature_source):]
+
+                k1 = KMeans(n_clusters=self.n_clusters,random_state=42)
+                print('doing kmean 1')
+                sc = k1.fit_predict(source_points)
+                k2 = KMeans(n_clusters=self.n_clusters,random_state=42,init=k1.cluster_centers_)
+                print('doing kmean 2')
+                tc = k2.fit_predict(target_points)
+                print('getting best match')
+                self.best_matchs_indexes=get_best_match(k1.cluster_centers_,k2.cluster_centers_)
+                self.slice_to_cluster = {}
+                items = list(self.slice_to_feature_source.items())
+                for i in range(len(self.slice_to_feature_source)):
+                    self.source_clusters[sc[i]].append(items[i][1])
+                    self.slice_to_cluster[items[i][0]] = sc[i]
+                items = list(self.slice_to_feature_target.items())
+                for i in range(len(self.slice_to_feature_target)):
+                    self.slice_to_cluster[items[i][0]] = tc[i]
+                for i in range(len(self.source_clusters)):
+                    self.source_clusters[i] = np.mean(self.source_clusters[i],axis=0)
+                self.best_matchs = []
+                for i in range(len(self.best_matchs_indexes)):
+                    self.best_matchs.append(torch.tensor(self.source_clusters[self.best_matchs_indexes[i]]))
+
+                cm = plt.get_cmap('gist_rainbow')
+                cNorm  = mplcolors.Normalize(vmin=0, vmax=self.n_clusters-1)
+                scalarMap = mplcm.ScalarMappable(norm=cNorm, cmap=cm)
+                colors = []
+                for i in range(self.n_clusters):
+                    colors.append(scalarMap.to_rgba(i))
+                # colors = ['black','blue','cyan','red','orange'
+                #     ,'tomato','lime','gold','magenta','dodgerblue'
+                #     ,'peru','grey','brown','olive','navy'
+                #     ,'blueviolet','darkgreen','maroon','yellow','cadetblue']
+                im_path_source =str(self.exp_dir /  f'{step}_source.png')
+                fig = plt.figure()
+                ax = fig.add_subplot()
+                curr_colors = []
+                curr_points_x = []
+                curr_points_y = []
+                for i, slc_name in enumerate(self.slice_to_feature_source.keys()):
+                    curr_points_x.append(source_points[i][0])
+                    curr_points_y.append(source_points[i][1])
+                    curr_colors.append(colors[self.slice_to_cluster[slc_name]])
+                ax.scatter(curr_points_x,curr_points_y,marker = '.',c=curr_colors)
+                plt.savefig(im_path_source)
+                plt.cla()
+                plt.clf()
+                plt.close()
+                im_path_target = str(self.exp_dir /  f'{step}_target.png')
+
+                fig = plt.figure()
+                ax = fig.add_subplot()
+                curr_colors = []
+                curr_points_x = []
+                curr_points_y = []
+                for i, slc_name in enumerate(self.slice_to_feature_target.keys()):
+                    curr_points_x.append(target_points[i][0])
+                    curr_points_y.append(target_points[i][1])
+                    curr_colors.append(colors[self.best_matchs_indexes[self.slice_to_cluster[slc_name]]])
+                ax.scatter(curr_points_x,curr_points_y,marker = '.',c=curr_colors)
+                plt.savefig(im_path_target)
+                plt.cla()
+                plt.clf()
+                plt.close()
+                im_path_clusters = str(self.exp_dir /  f'{step}_clusters.png')
+                fig = plt.figure()
+                ax = fig.add_subplot()
+
+                for i,(p,marker) in enumerate([(k1.cluster_centers_,'.'),(k2.cluster_centers_,'^')]):
+                    if i ==0:
+                        ax.scatter(p[:,0],p[:,1],marker = marker,c=colors[:len(p)])
+                    else:
+                        ax.scatter(p[:,0],p[:,1],marker = marker,c=[colors[self.best_matchs_indexes[i]] for i in range(len(p))])
+                plt.savefig(im_path_clusters)
+                plt.cla()
+                plt.clf()
+                plt.close()
+                self.slice_to_feature_source = {}
+                self.slice_to_feature_target = {}
+
+                log_log = {f'figs/source': wandb.Image(im_path_source),f'figs/target': wandb.Image(im_path_target),f'figs/cluster': wandb.Image(im_path_clusters)}
+                wandb.log(log_log,step=epoch*len(self.tgt_train_loader))
+            log_log = {}
+
+            images, labels,imnames = src_data
+            images = Variable(images).to(os.environ['CUDA_VISIBLE_DEVICES'])
+            labels = labels.to(os.environ['CUDA_VISIBLE_DEVICES'])
+            features = self.encoder(images)
+            outputs = self.classfier(features)
+
+            features = features.detach().cpu().numpy()
+            for imname,feature,img in zip(imnames,features,images):
+                self.slice_to_feature_source[imname] = feature
+                if self.best_matchs is not None and imname in self.slice_to_cluster:
+                    src_cluster = self.slice_to_cluster[imname]
+                    if f'source_{src_cluster}' not in vizviz or len(vizviz[f'source_{src_cluster}']) < 3:
+                        if f'source_{src_cluster}' not in vizviz:
+                            vizviz[f'source_{src_cluster}'] = []
+                        vizviz[f'source_{src_cluster}'].append(None)
+                        im_path =  str(self.exp_dir / f'source_{src_cluster}_{step}_{len(vizviz[f"source_{src_cluster}"])}.png')
+                        plt.imsave(im_path,  np.array(img[1].detach().cpu()), cmap='gray')
+                        log_log[f'{src_cluster}/source_{len(vizviz[f"source_{src_cluster}"])}'] = wandb.Image(im_path)
+            loss_cls = self.ce(outputs,labels)
+
+
+            images, labels,imnames = tgt_data
+            images = Variable(images).to(os.environ['CUDA_VISIBLE_DEVICES'])
+            # labels = labels.to(os.environ['CUDA_VISIBLE_DEVICES'])
+            features = self.encoder(images)
+            dist_loss = torch.tensor(0.0,device=os.environ['CUDA_VISIBLE_DEVICES'])
+            for imname,feature,img in zip(imnames,features,images):
+                self.slice_to_feature_target[imname] = feature.detach().cpu().numpy()
+                if self.best_matchs is not None and  imname in self.slice_to_cluster:
+                    self.accumulate_for_loss[self.slice_to_cluster[imname]].append(feature)
+                    src_cluster = self.best_matchs_indexes[self.slice_to_cluster[imname]]
+                    if f'target_{src_cluster}' not in vizviz or len(vizviz[f'target_{src_cluster}']) < 3:
+                        if f'target_{src_cluster}' not in vizviz:
+                            vizviz[f'target_{src_cluster}'] = []
+                        vizviz[f'target_{src_cluster}'].append(None)
+                        im_path =  str(self.exp_dir /  f'target_{src_cluster}_{step}_{len(vizviz[f"target_{src_cluster}"])}.png')
+                        plt.imsave(im_path,  np.array(img[1].detach().cpu()), cmap='gray')
+                        log_log[f'{src_cluster}/target_{len(vizviz[f"target_{src_cluster}"])}'] = wandb.Image(im_path)
+
+            self.use_dist_loss = False
+            lens1 = [len(x) for x in self.accumulate_for_loss]
+            if np.sum(lens1) > self.acc_amount:
+                self.use_dist_loss = True
+            if self.use_dist_loss:
+                total_amount = 0
+                dist_losses = [0] * len(self.accumulate_for_loss)
+                for i,features in enumerate(self.accumulate_for_loss):
+                    if len(features) > 0:
+                        curr_amount = len(features)
+                        total_amount+=curr_amount
+                        features = torch.mean(torch.stack(features),dim=0)
+                        dist_losses[i] = torch.mean((features - self.best_matchs[i].to(os.environ['CUDA_VISIBLE_DEVICES']))**2) * curr_amount
+                        self.accumulate_for_loss[i] = []
+                for l  in dist_losses:
+                    if l >0:
+                        dist_loss+=l
+                        dist_loss/= total_amount
+            if float(dist_loss) > 0:
+                self.epoch_dist_loss.append(float(dist_loss))
+            self.epoch_cls_loss.append(float(loss_cls))
+            losses_dict = {'cls_loss': loss_cls,'dist_loss':dist_loss,'total':loss_cls+dist_loss*20}
+
+            if self.use_dist_loss:
+                losses_dict['total'].backward()
+                self.optimizer.step()
+
+                self.optimizer.zero_grad()
+            elif self.best_matchs is None:
+                pass
+                # losses_dict['seg_loss'].backward()
+                # optimizer.step()
+                # scheduler.step()
+                # optimizer.zero_grad()
+            else:
+                losses_dict['cls_loss'].backward(retain_graph=True)
+
+            log_log['cls_loss'] = float(np.mean(self.epoch_cls_loss))
+            if self.epoch_dist_loss:
+                log_log['dist_loss'] = float(np.mean(self.epoch_dist_loss))
+
+            wandb.log(log_log,step=step + (epoch*len(self.tgt_train_loader)))
+
