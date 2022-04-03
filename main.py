@@ -31,7 +31,7 @@ parser.add_argument('-sp_start', default=100, type=int, help='Self-Penalization'
 parser.add_argument('-cr_start', default=100, type=int, help='Consistency Regularization')
 parser.add_argument('-lam_sd', default=0.7, type=float, help='Source Dominant Mixup ratio')
 parser.add_argument('-lam_td', default=0.3, type=float, help='Target Dominant Mixup ratio')
-parser.add_argument('-mode', default='source', type=str)
+parser.add_argument('-mode', default='clustering', type=str)
 
 
 def main():
@@ -54,12 +54,15 @@ def main():
     src_test_loader = torchdata.DataLoader(src_testset, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True, drop_last=False)
 
     lr, l2_decay, momentum, nesterov = utils.get_train_info()
-    net_sd, head_sd, classifier_sd = utils.get_net_info(num_classes)
-    net_td, head_td, classifier_td = utils.get_net_info(num_classes)
+    net_sd, classifier_sd = utils.get_net_info(num_classes)
+    net_td, classifier_td = utils.get_net_info(num_classes)
 
-    learnable_params_sd = list(net_sd.parameters()) + list(head_sd.parameters()) + list(classifier_sd.parameters())
-    learnable_params_td = list(net_td.parameters()) + list(head_td.parameters()) + list(classifier_td.parameters())
 
+    learnable_params_td = list(net_td.parameters())  + list(classifier_td.parameters())
+    # if args.mode == 'clustering':
+    #     learnable_params_sd = list(net_sd.parameters())
+    # else:
+    learnable_params_sd = list(net_sd.parameters())  + list(classifier_sd.parameters())
     optimizer_sd = optim.SGD(learnable_params_sd, lr=lr, momentum=momentum, weight_decay=l2_decay, nesterov=nesterov)
     optimizer_td = optim.SGD(learnable_params_td, lr=lr, momentum=momentum, weight_decay=l2_decay, nesterov=nesterov)
 
@@ -73,12 +76,12 @@ def main():
     mse = nn.MSELoss().to(os.environ['CUDA_VISIBLE_DEVICES'])
 
     # net_sd, head_sd, classifier_sd = utils.load_net(args, net_sd, head_sd, classifier_sd)
-    net_td, head_td, classifier_td = copy.deepcopy(net_sd), copy.deepcopy(head_sd), copy.deepcopy(classifier_sd)
+    net_td, classifier_td = copy.deepcopy(net_sd),  copy.deepcopy(classifier_sd)
     
     loaders = [src_train_loader, tgt_train_loader]
     optimizers = [optimizer_sd, optimizer_td]
-    models_sd = [net_sd, head_sd, classifier_sd]
-    models_td = [net_td, head_td, classifier_td]
+    models_sd = [net_sd, classifier_sd]
+    models_td = [net_td, classifier_td]
     sp_params = [sp_param_sd, sp_param_td]
     losses = [ce, mse]
     wandb.init(
@@ -87,12 +90,13 @@ def main():
         name=args.mode,
 
     )
+    sched = partial(utils.optimizer_scheduler, total_steps=len(loaders[0])*args.epochs,optimizer = optimizers[0],lr=lr)
     if args.mode == 'clustering':
         models_sd = utils.load_net(args, *models_sd)
-        tt  = ClusteringTrainer(loaders=loaders,optimizer=optimizer_sd,models_sd=models_sd,ce=ce)
+        tt  = ClusteringTrainer(loaders=loaders,models_sd=models_sd,ce=ce,idx_to_class={v:k for k,v in tgt_trainset.class_to_idx.items()},sched=sched)
     for epoch in range(args.epochs):
         if args.mode == 'source':
-            sched = partial(utils.optimizer_scheduler, total_steps=len(loaders[0])*args.epochs,optimizer = optimizers[0],lr=lr)
+
             train_only_source(args,loaders[0],models_sd,losses[0],epoch,sched)
         elif args.mode == 'fixbi':
             train_fixbi(args, loaders, optimizers, models_sd, models_td, sp_params, losses, epoch)
